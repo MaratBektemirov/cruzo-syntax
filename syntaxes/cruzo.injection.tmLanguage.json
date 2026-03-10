@@ -1,0 +1,159 @@
+{
+  "$schema": "./tmlanguage.schema.json",
+  "name": "Cruzo TypeScript Injection",
+  "scopeName": "source.ts.cruzo.injection",
+  "injectionSelector": "L:string.template.ts, L:string.template.js",
+  "patterns": [
+    {
+      "include": "#html-tag"
+    },
+    {
+      "include": "#mustache-expression"
+    },
+    {
+      "include": "#cruzo-attributes"
+    }
+  ],
+  "repository": {
+    "html-tag": {
+      "begin": "(</?)([A-Za-z][\\w:-]*)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.tag.begin.html"
+        },
+        "2": {
+          "name": "entity.name.tag.html"
+        }
+      },
+      "end": "(/?>)",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.tag.end.html"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#html-attributes"
+        },
+        {
+          "include": "#cruzo-attributes"
+        }
+      ]
+    },
+    "html-attributes": {
+      "patterns": [
+        {
+          "match": "\\b[A-Za-z_:][\\w:.-]*\\b",
+          "name": "entity.other.attribute-name.html"
+        },
+        {
+          "begin": "(=\\s*)(\")",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.separator.key-value.html"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.html"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.html"
+            }
+          },
+          "name": "string.quoted.double.html",
+          "patterns": [
+            {
+              "include": "#mustache-expression"
+            }
+          ]
+        },
+        {
+          "begin": "(=\\s*)(')",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.separator.key-value.html"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.html"
+            }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.html"
+            }
+          },
+          "name": "string.quoted.single.html",
+          "patterns": [
+            {
+              "include": "#mustache-expression"
+            }
+          ]
+        }
+      ]
+    },
+    "mustache-expression": {
+      "name": "meta.embedded.expression.cruzo",
+      "begin": "\\{\\{",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.template-expression.begin.cruzo"
+        }
+      },
+      "end": "\\}\\}",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.template-expression.end.cruzo"
+        }
+      },
+      "patterns": [
+        {
+          "match": "\\bonce::",
+          "name": "keyword.control.once.cruzo"
+        },
+        {
+          "match": "::rx\\b",
+          "name": "keyword.operator.reactive.cruzo"
+        },
+        {
+          "match": "\\b(root|this|event|index|app)\\b|\\$element\\b",
+          "name": "variable.language.cruzo"
+        },
+        {
+          "match": "\\?\\.|\\?\\?|=>|===|!==|==|!=|<=|>=|&&|\\|\\||[+\\-*/%!=<>]",
+          "name": "keyword.operator.expression.cruzo"
+        },
+        {
+          "match": "\\b(true|false|null|undefined)\\b",
+          "name": "constant.language.cruzo"
+        },
+        {
+          "match": "'[^']*'|\"[^\"]*\"|`[^`]*`",
+          "name": "string.quoted.cruzo"
+        },
+        {
+          "match": "\\b\\d+(?:\\.\\d+)?\\b",
+          "name": "constant.numeric.cruzo"
+        }
+      ]
+    },
+    "cruzo-attributes": {
+      "patterns": [
+        {
+          "match": "\\b(repeat|attached|inner-html)\\b",
+          "name": "entity.other.attribute-name.cruzo"
+        },
+        {
+          "match": "\\blet-[a-zA-Z_][\\w-]*\\b",
+          "name": "entity.other.attribute-name.let.cruzo"
+        },
+        {
+          "match": "\\bon[a-zA-Z]+\\b",
+          "name": "entity.other.attribute-name.event.cruzo"
+        }
+      ]
+    }
+  }
+}

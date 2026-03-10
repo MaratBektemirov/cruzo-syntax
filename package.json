@@ -1,0 +1,69 @@
+{
+  "name": "cruzo-syntax",
+  "displayName": "Cruzo Syntax",
+  "description": "Syntax highlighting and formatting support for Cruzo templates",
+  "version": "0.0.1",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript"
+  ],
+  "categories": [
+    "Programming Languages",
+    "Formatters"
+  ],
+  "icon": "assets/icon.png",
+  "main": "./src/extension.js",
+  "contributes": {
+    "grammars": [
+      {
+        "scopeName": "text.html.cruzo",
+        "path": "./syntaxes/cruzo.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.expression.cruzo": "javascript"
+        }
+      },
+      {
+        "scopeName": "source.ts.cruzo.injection",
+        "path": "./syntaxes/cruzo.injection.tmLanguage.json",
+        "injectTo": [
+          "source.ts",
+          "source.js"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.cruzo": "html",
+          "meta.embedded.expression.cruzo": "javascript"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "cruzo.formatTemplatesInFile",
+        "title": "Cruzo: Format Templates In Current File"
+      },
+      {
+        "command": "cruzo.formatTemplatesInWorkspace",
+        "title": "Cruzo: Format Templates In Workspace"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Cruzo Syntax",
+      "properties": {
+        "cruzo.format.indentSize": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Indentation size used by Cruzo formatter."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "ignore": "^7.0.5"
+  }
+}
