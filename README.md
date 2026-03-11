@@ -37,6 +37,7 @@ In TypeScript/JavaScript files:
 3. Open a `.ts` file with `getHTML() { return \`...\`; }`.
 4. Check highlighting inside the template literal.
 5. Run **Cruzo: Format Templates In Current File**.
+6. Create .vsix file with `vsce package`
 
 ## Notes
 

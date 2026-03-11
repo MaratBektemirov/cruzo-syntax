@@ -2,11 +2,23 @@
   "name": "cruzo-syntax",
   "displayName": "Cruzo Syntax",
   "description": "Syntax highlighting and formatting support for Cruzo templates",
-  "version": "0.0.1",
+  "version": "0.8.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MaratBektemirov/cruzo-syntax"
+  },
+  "publisher": "Cruzo",
+  "keywords": [
+    "syntax",
+    "cruzo",
+    "language",
+    "highlighting",
+    "programming language"
+  ],
   "activationEvents": [
     "onLanguage:javascript",
     "onLanguage:typescript"

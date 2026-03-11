@@ -29,6 +29,7 @@ const RE_CRUZO_MARKERS = /\{\{[\s\S]*\}\}|::rx\b|\bonce::|\b(?:repeat|attached|i
 const RE_WORD_RANGE = /[A-Za-z_$][\w$-]*/;
 const RE_TAG_CONTEXT = /<\/*[A-Za-z][\w:-]*$/;
 const RE_REPEAT_ATTR = /\brepeat\s*=\s*(?:"([^"]*)"|'([^']*)')/;
+const RE_LET_ATTR = /\blet-([A-Za-z_$][\w$]*)\s*=/g;
 const RE_COMPLETION_OWNER = /(?:^|[^\w$])(root|this)(?:\s*::rx)?\s*(?:\?\.|\.)\s*[A-Za-z_$\w$]*$/;
 const RE_ATTR_CONTEXT = /<[^>]*$/;
 const RE_IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
@@ -178,24 +179,155 @@ function getLineLeadingWhitespace(lineText) {
   return lineText.match(/^\s*/)[0] || "";
 }
 
+function skipQuotedStringLiteral(text, startIndex, quote) {
+  let i = startIndex + 1;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === quote) {
+      return i + 1;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+function skipSingleLineComment(text, startIndex) {
+  let i = startIndex + 2;
+  while (i < text.length) {
+    if (text[i] === "\n") {
+      return i + 1;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+function skipMultiLineComment(text, startIndex) {
+  let i = startIndex + 2;
+  while (i < text.length - 1) {
+    if (text[i] === "*" && text[i + 1] === "/") {
+      return i + 2;
+    }
+    i += 1;
+  }
+  return text.length;
+}
+
+function parseTemplateExpression(text, startIndex, ranges) {
+  let i = startIndex;
+  let depth = 1;
+
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (ch === "'" || ch === "\"") {
+      i = skipQuotedStringLiteral(text, i, ch);
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      i = skipSingleLineComment(text, i);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipMultiLineComment(text, i);
+      continue;
+    }
+
+    if (ch === "`") {
+      i = parseTemplateLiteralRange(text, i, ranges);
+      continue;
+    }
+
+    if (ch === "{") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      i += 1;
+      if (depth === 0) {
+        return i;
+      }
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return i;
+}
+
+function parseTemplateLiteralRange(text, startIndex, ranges) {
+  let i = startIndex + 1;
+
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+
+    if (ch === "`") {
+      ranges.push({ start: startIndex, end: i });
+      return i + 1;
+    }
+
+    if (ch === "$" && next === "{") {
+      i = parseTemplateExpression(text, i + 2, ranges);
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return i;
+}
+
 function findAllTemplateLiteralTargets(document, indentSize) {
   const text = document.getText();
+  const ranges = [];
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (ch === "'" || ch === "\"") {
+      i = skipQuotedStringLiteral(text, i, ch);
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      i = skipSingleLineComment(text, i);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipMultiLineComment(text, i);
+      continue;
+    }
+
+    if (ch === "`") {
+      i = parseTemplateLiteralRange(text, i, ranges);
+      continue;
+    }
+
+    i += 1;
+  }
+
   const targets = [];
-  let start = -1;
-
-  for (let i = 0; i < text.length; i += 1) {
-    if (text[i] !== "`" || isEscapedBacktick(text, i)) {
-      continue;
-    }
-
-    if (start === -1) {
-      start = i;
-      continue;
-    }
-
-    const rangeStart = document.positionAt(start + 1);
-    const rangeEnd = document.positionAt(i);
-    const openingPosition = document.positionAt(start);
+  for (const range of ranges) {
+    const rangeStart = document.positionAt(range.start + 1);
+    const rangeEnd = document.positionAt(range.end);
+    const openingPosition = document.positionAt(range.start);
     const openingLine = document.lineAt(openingPosition.line).text;
     const hostIndent = getLineLeadingWhitespace(openingLine);
     const baseIndent = `${hostIndent}${" ".repeat(indentSize)}`;
@@ -204,7 +336,6 @@ function findAllTemplateLiteralTargets(document, indentSize) {
       range: new vscode.Range(rangeStart, rangeEnd),
       baseIndent
     });
-    start = -1;
   }
 
   return targets;
@@ -782,6 +913,151 @@ function findThisRepeatMemberDefinitions(document, position, templateTarget, pro
   return [];
 }
 
+function extractLetDeclarationsFromTag(tagText, tagStartOffsetInRaw, relativeOffset) {
+  const declarations = [];
+  const tagNameMatch = tagText.match(/^<\s*[A-Za-z][\w:-]*/);
+  const attrSearchStart = tagNameMatch ? tagNameMatch[0].length : 0;
+  const insideCurrentTag = relativeOffset >= tagStartOffsetInRaw
+    && relativeOffset <= tagStartOffsetInRaw + tagText.length - 1;
+  let match;
+
+  while ((match = RE_LET_ATTR.exec(tagText)) !== null) {
+    const name = match[1];
+    const full = match[0];
+    const idxInFull = full.lastIndexOf(name);
+    if (idxInFull === -1 || match.index < attrSearchStart) {
+      continue;
+    }
+
+    const start = tagStartOffsetInRaw + match.index + idxInFull;
+    if (insideCurrentTag && start > relativeOffset) {
+      continue;
+    }
+
+    declarations.push({
+      name,
+      start,
+      end: start + name.length
+    });
+  }
+
+  RE_LET_ATTR.lastIndex = 0;
+  return declarations;
+}
+
+function getActiveLetDeclarations(rawTemplate, relativeOffset) {
+  const stack = [];
+  let cursor = 0;
+
+  while (cursor < rawTemplate.length) {
+    const tagStart = rawTemplate.indexOf("<", cursor);
+    if (tagStart === -1 || tagStart > relativeOffset) {
+      break;
+    }
+
+    const tagEnd = findTagEndIndexInText(rawTemplate, tagStart);
+    if (tagEnd === -1) {
+      break;
+    }
+
+    const tagText = rawTemplate.slice(tagStart, tagEnd + 1);
+    cursor = tagEnd + 1;
+
+    if (/^<!--/.test(tagText)) {
+      continue;
+    }
+
+    const closeMatch = tagText.match(/^<\s*\/\s*([A-Za-z][\w:-]*)/);
+    if (closeMatch) {
+      const closeName = closeMatch[1].toLowerCase();
+      for (let i = stack.length - 1; i >= 0; i -= 1) {
+        if (stack[i].name === closeName) {
+          stack.splice(i);
+          break;
+        }
+      }
+      continue;
+    }
+
+    const openMatch = tagText.match(/^<\s*([A-Za-z][\w:-]*)/);
+    if (!openMatch) {
+      continue;
+    }
+
+    const name = openMatch[1].toLowerCase();
+    const selfClosing = /\/\s*>$/.test(tagText) || VOID_ELEMENTS.has(name);
+    const lets = extractLetDeclarationsFromTag(tagText, tagStart, relativeOffset);
+    stack.push({ name, lets });
+
+    if (selfClosing) {
+      stack.pop();
+    }
+  }
+
+  const active = new Map();
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    for (const letDecl of stack[i].lets) {
+      if (!active.has(letDecl.name)) {
+        active.set(letDecl.name, letDecl);
+      }
+    }
+  }
+  return active;
+}
+
+function getLetMemberAtPosition(document, position, templateTarget) {
+  const wordRange = getWordRangeAtPosition(document, position);
+  if (!wordRange) {
+    return null;
+  }
+
+  const word = document.getText(wordRange);
+  if (!RE_IDENTIFIER.test(word)) {
+    return null;
+  }
+
+  const templateStartOffset = document.offsetAt(templateTarget.range.start);
+  const relativeOffset = document.offsetAt(position) - templateStartOffset;
+  const activeLets = getActiveLetDeclarations(templateTarget.raw, relativeOffset);
+  const declaration = activeLets.get(word);
+  if (!declaration) {
+    return null;
+  }
+
+  const declarationRange = new vscode.Range(
+    document.positionAt(templateStartOffset + declaration.start),
+    document.positionAt(templateStartOffset + declaration.end)
+  );
+
+  return {
+    name: word,
+    wordRange,
+    declarationRange
+  };
+}
+
+function getLetAttributeAtPosition(document, position, templateTarget) {
+  const templateStartOffset = document.offsetAt(templateTarget.range.start);
+  const relativeOffset = document.offsetAt(position) - templateStartOffset;
+  let match;
+
+  while ((match = RE_LET_ATTR.exec(templateTarget.raw)) !== null) {
+    const full = match[0];
+    const name = match[1];
+    const start = match.index || 0;
+    const end = start + full.length;
+    if (relativeOffset < start || relativeOffset > end) {
+      continue;
+    }
+
+    RE_LET_ATTR.lastIndex = 0;
+    return { name };
+  }
+
+  RE_LET_ATTR.lastIndex = 0;
+  return null;
+}
+
 function collectComponentMembers(document) {
   const cacheKey = `${document.uri.toString()}::${document.version}`;
   const cached = componentMembersCache.get(cacheKey);
@@ -936,6 +1212,7 @@ function getCruzoHoverForWord(word) {
     "inner-html": "Sets `innerHTML` from expression result.",
     index: "Current index in `repeat` scope.",
     event: "Current event in `on*` expression.",
+    let: "Prefix for lexical template variables via `let-*` attributes.",
     root: "Component instance in template expression.",
     this: "Repeat item (or current context).",
     "::rx": "Reactive unwrap operator for `Rx` values.",
@@ -1080,7 +1357,7 @@ function activate(context) {
 
     const edits = buildTemplateEdits(editor.document, getIndentSize());
     if (!edits.length) {
-      vscode.window.showInformationMessage("No template literals found in current file.");
+      vscode.window.showInformationMessage("No template literals suitable for formatting found in current file.");
       return;
     }
 
@@ -1139,7 +1416,7 @@ function activate(context) {
     }
 
     if (!formattedBlocks) {
-      vscode.window.showInformationMessage("No template literals found in .ts/.js workspace files.");
+      vscode.window.showInformationMessage("No template literals suitable for formatting found in .ts/.js workspace files.");
       return;
     }
 
@@ -1179,6 +1456,11 @@ function activate(context) {
             }
           }
         }
+
+      const letMember = getLetMemberAtPosition(document, position, templateTarget);
+      if (letMember) {
+        return [new vscode.Location(document.uri, letMember.declarationRange)];
+      }
 
         const wordRange = getWordRangeAtPosition(document, position);
         if (!wordRange) {
@@ -1358,6 +1640,23 @@ function activate(context) {
             );
           }
         }
+      }
+
+      const letAttribute = getLetAttributeAtPosition(document, position, templateTarget);
+      if (letAttribute) {
+        return new vscode.Hover(
+          new vscode.MarkdownString(
+            `Lexical Cruzo variable declaration via \`let-${letAttribute.name}\`.`
+          )
+        );
+      }
+
+      const letMember = getLetMemberAtPosition(document, position, templateTarget);
+      if (letMember) {
+        const declarationLine = document.lineAt(letMember.declarationRange.start.line).text.trim();
+        return new vscode.Hover(
+          new vscode.MarkdownString(`Cruzo lexical variable \`${letMember.name}\`\n\n\`${declarationLine}\``)
+        );
       }
 
       const line = document.lineAt(position.line).text;
