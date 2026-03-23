@@ -2,7 +2,7 @@
   "name": "cruzo-syntax",
   "displayName": "Cruzo Syntax",
   "description": "Syntax highlighting and formatting support for Cruzo templates",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
