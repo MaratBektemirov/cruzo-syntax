@@ -1,6 +1,7 @@
 const path = require("path");
 const ignore = require("ignore");
 const vscode = require("vscode");
+const cruzoTS = require("./cruzo-typescript");
 
 const VOID_ELEMENTS = new Set([
   "area",
@@ -22,7 +23,6 @@ const VOID_ELEMENTS = new Set([
 const selectorLocationCache = new Map();
 let selectorLocationCacheRevision = 0;
 const templateTargetsCache = new Map();
-const componentMembersCache = new Map();
 const MAX_LOCAL_CACHE_SIZE = 300;
 const RE_HTML_TAG = /<\/?[A-Za-z][\w:-]*[\s>]/;
 const RE_CRUZO_MARKERS = /\{\{[\s\S]*\}\}|::rx\b|\bonce::|\b(?:repeat|attached|inner-html|let-[a-zA-Z_][\w-]*|on[a-zA-Z]+)\s*=/;
@@ -30,9 +30,6 @@ const RE_WORD_RANGE = /[A-Za-z_$][\w$-]*/;
 const RE_TAG_CONTEXT = /<\/*[A-Za-z][\w:-]*$/;
 const RE_REPEAT_ATTR = /\brepeat\s*=\s*(?:"([^"]*)"|'([^']*)')/;
 const RE_LET_ATTR = /\blet-([A-Za-z_$][\w$]*)\s*=/g;
-const RE_COMPLETION_OWNER = /(?:^|[^\w$])(root|this)(?:\s*::rx)?\s*(?:\?\.|\.)\s*[A-Za-z_$\w$]*$/;
-const RE_COMPLETION_MEMBER_CHAIN = /(?:^|[^\w$])(root|this)(?:\s*::rx)?((?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*|\s*\[\s*(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\d+)\s*\]|\s*::rx)+)\s*(?:\?\.|\.)\s*[A-Za-z_$\w$]*$/;
-const RE_ACCESSOR_CHAIN = /\b(root|this)(?:\s*::rx)?((?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*|\s*\[\s*(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\d+)\s*\]|\s*::rx)+)/g;
 const RE_OWNER_CHAIN_EXACT = /^\s*(root|this)(?:\s*::rx)?((?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*|\s*\[\s*(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\d+)\s*\]|\s*::rx)+)\s*$/;
 const RE_ATTR_CONTEXT = /<[^>]*$/;
 const RE_IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
@@ -492,7 +489,10 @@ function getRootMemberAtPosition(document, position, templateTarget) {
     const memberEnd = memberStart + member.length;
     if (wordStartOffset >= memberStart && wordEndOffset <= memberEnd && member === word) {
       return {
+        owner: "root",
         name: member,
+        segments: [{ kind: "member", name: member, start: memberStart, end: memberEnd }],
+        targetSegmentIndex: 0,
         wordRange
       };
     }
@@ -512,8 +512,14 @@ function getTemplateAccessorMemberAtPosition(document, position, templateTarget)
   const targetStartOffset = document.offsetAt(templateTarget.range.start);
   const wordStartOffset = document.offsetAt(wordRange.start) - targetStartOffset;
   const wordEndOffset = document.offsetAt(wordRange.end) - targetStartOffset;
-  const pattern = RE_ACCESSOR_CHAIN;
-  pattern.lastIndex = 0;
+  const rel = document.offsetAt(position) - targetStartOffset;
+  const activeLets = cruzoTS.getActiveLetBindingMap(raw, rel);
+  const letNames = [...activeLets.keys()].sort((a, b) => b.length - a.length);
+  const ownerAlt = ["root", "this", ...letNames].map(escapeRegExp).join("|");
+  const pattern = new RegExp(
+    `\\b(${ownerAlt})(?:\\s*::rx)?((?:\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$][\\w$]*|\\s*\\[\\s*(?:"[^"\\n]+"|'[^'\\n]+'|\`[^\\\`\\n]+\`|\\d+)\\s*\\]|\\s*::rx)+)`,
+    "g"
+  );
 
   for (const match of raw.matchAll(pattern)) {
     const owner = match[1];
@@ -548,7 +554,7 @@ function isOffsetInsideRange(offset, ranges) {
   return false;
 }
 
-function findEnclosingClassRange(document, position) {
+function findEnclosingClassRangeHeuristic(document, position) {
   const text = document.getText();
   const positionOffset = document.offsetAt(position);
   const classPattern = /\b(?:class|interface|type)\s+[A-Za-z_$][\w$]*[^{]*\{/g;
@@ -591,6 +597,22 @@ function findEnclosingClassRange(document, position) {
   return bestRange;
 }
 
+function findEnclosingClassRange(document, position) {
+  const sourceFile = cruzoTS.getSourceFile(document);
+  if (!sourceFile) {
+    return findEnclosingClassRangeHeuristic(document, position);
+  }
+  const offset = document.offsetAt(position);
+  const cls = cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, offset);
+  if (!cls) {
+    return findEnclosingClassRangeHeuristic(document, position);
+  }
+  return new vscode.Range(
+    document.positionAt(cls.getStart(sourceFile)),
+    document.positionAt(cls.getEnd())
+  );
+}
+
 function findMemberDeclarations(document, memberName, searchRange = null) {
   const text = document.getText();
   const rangeStart = searchRange ? document.offsetAt(searchRange.start) : 0;
@@ -622,158 +644,6 @@ function findMemberDeclarations(document, memberName, searchRange = null) {
         continue;
       }
       ranges.push(new vscode.Range(document.positionAt(absoluteStart), document.positionAt(absoluteEnd)));
-    }
-  }
-
-  return ranges;
-}
-
-function findMemberAssignmentStarts(document, memberName, searchRange = null) {
-  const text = document.getText();
-  const rangeStart = searchRange ? document.offsetAt(searchRange.start) : 0;
-  const rangeEnd = searchRange ? document.offsetAt(searchRange.end) : text.length;
-  const source = text.slice(rangeStart, rangeEnd);
-  const escaped = escapeRegExp(memberName);
-  const pattern = new RegExp(
-    `^\\s*(?:public\\s+|private\\s+|protected\\s+|readonly\\s+|static\\s+)*(?:declare\\s+)?${escaped}\\s*(?::[^=\\n]+)?\\s*=`,
-    "gm"
-  );
-  const starts = [];
-  let match;
-  while ((match = pattern.exec(source)) !== null) {
-    const idx = rangeStart + (match.index || 0) + match[0].lastIndexOf("=");
-    starts.push(idx + 1);
-  }
-  return starts;
-}
-
-function isLikelyClassMemberStart(text, offset) {
-  let i = offset;
-  while (i < text.length && /\s/.test(text[i])) {
-    i += 1;
-  }
-
-  if (i >= text.length) {
-    return true;
-  }
-
-  if (text[i] === "}") {
-    return true;
-  }
-
-  const tail = text.slice(i, Math.min(i + 220, text.length));
-  return /^(?:(?:public|private|protected|readonly|static|async|declare|get|set)\s+)*(?:[#A-Za-z_$][\w$]*)\s*(?:[!?])?\s*(?:\(|:|=|<)/.test(tail);
-}
-
-function readAssignedExpression(text, startOffset) {
-  let i = startOffset;
-  while (i < text.length && /\s/.test(text[i])) {
-    i += 1;
-  }
-
-  const exprStart = i;
-  let quote = null;
-  let templateDepth = 0;
-  const stack = [];
-
-  for (; i < text.length; i += 1) {
-    const ch = text[i];
-
-    if (quote) {
-      if (ch === "\\") {
-        i += 1;
-        continue;
-      }
-      if (ch === quote) {
-        quote = null;
-      }
-      continue;
-    }
-
-    if (ch === "'" || ch === "\"") {
-      quote = ch;
-      continue;
-    }
-
-    if (ch === "`") {
-      templateDepth = templateDepth === 0 ? 1 : 0;
-      continue;
-    }
-    if (templateDepth > 0) {
-      continue;
-    }
-
-    if (ch === "(" || ch === "{" || ch === "[") {
-      stack.push(ch);
-      continue;
-    }
-
-    if (ch === ")" || ch === "}" || ch === "]") {
-      if (stack.length > 0) {
-        stack.pop();
-        continue;
-      }
-      if (ch === "}" && isLikelyClassMemberStart(text, i)) {
-        return {
-          start: exprStart,
-          end: i,
-          text: text.slice(exprStart, i)
-        };
-      }
-      continue;
-    }
-
-    if (ch === ";" && stack.length === 0) {
-      return {
-        start: exprStart,
-        end: i,
-        text: text.slice(exprStart, i)
-      };
-    }
-
-    if ((ch === "\n" || ch === "\r") && stack.length === 0 && isLikelyClassMemberStart(text, i + 1)) {
-      return {
-        start: exprStart,
-        end: i,
-        text: text.slice(exprStart, i)
-      };
-    }
-  }
-
-  return {
-    start: exprStart,
-    end: text.length,
-    text: text.slice(exprStart)
-  };
-}
-
-function findObjectKeyRangesInExpression(document, expressionStart, expressionText, propertyName) {
-  const ranges = [];
-  const escaped = escapeRegExp(propertyName);
-  const keyPattern = new RegExp(`(?:^|[,{]\\s*)(["'\`]?)(?:${escaped})\\1\\s*:`, "gm");
-  const objectLikePatterns = [
-    /newRx\s*(?:<[^>\n]+>)?\s*\(\s*\{[\s\S]*?\}\s*\)/g,
-    /\{[\s\S]*?\}/g
-  ];
-
-  for (const objectPattern of objectLikePatterns) {
-    let objectMatch;
-    while ((objectMatch = objectPattern.exec(expressionText)) !== null) {
-      const objectText = objectMatch[0];
-      const objectStart = expressionStart + (objectMatch.index || 0);
-      let keyMatch;
-      while ((keyMatch = keyPattern.exec(objectText)) !== null) {
-        const keyIndex = keyMatch[0].lastIndexOf(propertyName);
-        if (keyIndex === -1) {
-          continue;
-        }
-        const start = objectStart + keyMatch.index + keyIndex;
-        const end = start + propertyName.length;
-        ranges.push(new vscode.Range(document.positionAt(start), document.positionAt(end)));
-      }
-    }
-    if (ranges.length) {
-      return ranges;
     }
   }
 
@@ -874,53 +744,6 @@ function getRepeatExpressionChain(rawTemplate, relativeOffset) {
   return stack
     .map((item) => item.repeatExpression)
     .filter(Boolean);
-}
-
-function findRootSourceMemberFromRepeatChain(repeatChain) {
-  for (let i = repeatChain.length - 1; i >= 0; i -= 1) {
-    const sourceMatch = repeatChain[i].match(/^root(?:\s*::rx)?\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)$/);
-    if (sourceMatch) {
-      return sourceMatch[1];
-    }
-  }
-  return null;
-}
-
-function findThisRepeatMemberDefinitions(document, position, templateTarget, propertyName, classRange = null) {
-  const raw = templateTarget.raw;
-  const absoluteOffset = document.offsetAt(position);
-  const templateStart = document.offsetAt(templateTarget.range.start);
-  const relativeOffset = absoluteOffset - templateStart;
-  const repeatChain = getRepeatExpressionChain(raw, relativeOffset);
-  if (!repeatChain.length) {
-    return [];
-  }
-
-  const sourceMemberName = findRootSourceMemberFromRepeatChain(repeatChain);
-  if (!sourceMemberName) {
-    return [];
-  }
-
-  const assignmentStarts = findMemberAssignmentStarts(document, sourceMemberName, classRange);
-  if (!assignmentStarts.length) {
-    return [];
-  }
-
-  const text = document.getText();
-  for (const assignmentStart of assignmentStarts) {
-    const assigned = readAssignedExpression(text, assignmentStart);
-    const propertyRanges = findObjectKeyRangesInExpression(
-      document,
-      assigned.start,
-      assigned.text,
-      propertyName
-    );
-    if (propertyRanges.length) {
-      return propertyRanges;
-    }
-  }
-
-  return [];
 }
 
 function extractLetDeclarationsFromTag(tagText, tagStartOffsetInRaw, relativeOffset) {
@@ -1068,68 +891,35 @@ function getLetAttributeAtPosition(document, position, templateTarget) {
   return null;
 }
 
-function collectComponentMembers(document) {
-  const cacheKey = `${document.uri.toString()}::${document.version}`;
-  const cached = componentMembersCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const text = document.getText();
-  const members = new Map();
-  const methodRegex = /\b(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|async\s+|get\s+|set\s+|abstract\s+|override\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>\s*)?\(/g;
-  const fieldRegex = /\b(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|abstract\s+|override\s+)*(?:declare\s+)?([A-Za-z_$][\w$]*)(?:[!?])?\s*(?::|=)/g;
-
-  const pushMember = (name, kind, index) => {
-    if (name === "constructor") {
-      return;
-    }
-    if (!members.has(name)) {
-      const start = index;
-      const range = new vscode.Range(
-        document.positionAt(start),
-        document.positionAt(start + name.length)
-      );
-      members.set(name, { name, kind, range });
-    }
-  };
-
-  let match;
-  while ((match = methodRegex.exec(text)) !== null) {
-    const name = match[1];
-    const start = (match.index || 0) + match[0].indexOf(name);
-    pushMember(name, vscode.CompletionItemKind.Method, start);
-  }
-
-  while ((match = fieldRegex.exec(text)) !== null) {
-    const name = match[1];
-    const start = (match.index || 0) + match[0].indexOf(name);
-    pushMember(name, vscode.CompletionItemKind.Field, start);
-  }
-
-  const result = Array.from(members.values());
-  if (componentMembersCache.size > MAX_LOCAL_CACHE_SIZE) {
-    componentMembersCache.clear();
-  }
-  componentMembersCache.set(cacheKey, result);
-  return result;
-}
-
 function getTextBeforePosition(document, position, maxChars = 160) {
   const lineText = document.lineAt(position.line).text;
   const start = Math.max(0, position.character - maxChars);
   return lineText.slice(start, position.character);
 }
 
-function getExpressionOwnerForCompletion(document, position) {
+function getExpressionOwnerForCompletion(document, position, templateTarget) {
   const before = getTextBeforePosition(document, position);
-  const ownerMatch = before.match(RE_COMPLETION_OWNER);
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
+  const letNames = [...activeLets.keys()].sort((a, b) => b.length - a.length);
+  const ownersPattern = ["root", "this", ...letNames.map(escapeRegExp)].join("|");
+  const ownerRe = new RegExp(
+    `(?:^|[^\\w$])(${ownersPattern})(?:\\s*::rx)?\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$\\w$]*$`
+  );
+  const ownerMatch = before.match(ownerRe);
   return ownerMatch ? ownerMatch[1] : null;
 }
 
-function getCompletionOwnerMemberForPosition(document, position) {
+function getCompletionOwnerMemberForPosition(document, position, templateTarget) {
   const before = getTextBeforePosition(document, position);
-  const match = before.match(RE_COMPLETION_MEMBER_CHAIN);
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
+  const letNames = [...activeLets.keys()].sort((a, b) => b.length - a.length);
+  const ownersPattern = ["root", "this", ...letNames.map(escapeRegExp)].join("|");
+  const chainRe = new RegExp(
+    `(?:^|[^\\w$])(${ownersPattern})(?:\\s*::rx)?((?:\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$][\\w$]*|\\s*\\[\\s*(?:"[^"\\n]+"|'[^'\\n]+'|\`[^\\\`\\n]+\`|\\d+)\\s*\\]|\\s*::rx)+)\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$\\w$]*$`
+  );
+  const match = before.match(chainRe);
   if (!match) {
     return null;
   }
@@ -1190,166 +980,6 @@ function parseAccessorChainSegments(chainText, chainStartOffset = 0) {
   return segments;
 }
 
-function toLocation(locationLike) {
-  if (!locationLike) {
-    return null;
-  }
-  if ("uri" in locationLike && "range" in locationLike) {
-    return locationLike;
-  }
-  if ("targetUri" in locationLike && "targetSelectionRange" in locationLike) {
-    return {
-      uri: locationLike.targetUri,
-      range: locationLike.targetSelectionRange
-    };
-  }
-  if ("targetUri" in locationLike && "targetRange" in locationLike) {
-    return {
-      uri: locationLike.targetUri,
-      range: locationLike.targetRange
-    };
-  }
-  return null;
-}
-
-async function getMemberTypeContexts(document, memberName, classRange) {
-  const declarations = findMemberDeclarations(document, memberName, classRange);
-  if (!declarations.length) {
-    return [];
-  }
-
-  const typeLocations = await vscode.commands.executeCommand(
-    "vscode.executeTypeDefinitionProvider",
-    document.uri,
-    declarations[0].start
-  );
-  if (!typeLocations || !typeLocations.length) {
-    return [];
-  }
-
-  const result = [];
-  const seen = new Set();
-
-  for (const locationLike of typeLocations) {
-    const location = toLocation(locationLike);
-    if (!location) {
-      continue;
-    }
-
-    const targetDocument = location.uri.toString() === document.uri.toString()
-      ? document
-      : await vscode.workspace.openTextDocument(location.uri);
-    const targetClassRange = findEnclosingClassRange(targetDocument, location.range.start);
-    if (!targetClassRange) {
-      continue;
-    }
-    const key = `${location.uri.toString()}::${targetClassRange.start.line}:${targetClassRange.start.character}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    result.push({ document: targetDocument, classRange: targetClassRange });
-  }
-
-  return result;
-}
-
-function findTypeBodyRangesByName(document, typeName) {
-  const text = document.getText();
-  const escaped = escapeRegExp(typeName);
-  const patterns = [
-    new RegExp(`\\b(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?(?:class|interface)\\s+${escaped}\\b[^\\{]*\\{`, "g"),
-    new RegExp(`\\b(?:export\\s+)?(?:default\\s+)?type\\s+${escaped}\\b[^=\\n]*=\\s*\\{`, "g")
-  ];
-  const ranges = [];
-
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const start = match.index || 0;
-      const openBrace = start + match[0].lastIndexOf("{");
-      let depth = 1;
-      let i = openBrace + 1;
-      for (; i < text.length; i += 1) {
-        const ch = text[i];
-        if (ch === "{") {
-          depth += 1;
-        } else if (ch === "}") {
-          depth -= 1;
-          if (depth === 0) {
-            break;
-          }
-        }
-      }
-      if (depth === 0) {
-        ranges.push(new vscode.Range(document.positionAt(start), document.positionAt(i + 1)));
-      }
-    }
-  }
-
-  return ranges;
-}
-
-function extractRxGenericTypeName(document, declarationRange, memberName) {
-  const text = document.getText();
-  const startOffset = document.offsetAt(declarationRange.start);
-  const tail = text.slice(startOffset, Math.min(text.length, startOffset + 650));
-  const escaped = escapeRegExp(memberName);
-  const typeArgPattern = `(any|\\{[^>]*?\\}|[A-Za-z_$][\\w$]*)`;
-  const patterns = [
-    // `foo: Rx<T>;` or `foo: RxFunc<T>;`
-    new RegExp(`^${escaped}(?:[!?])?\\s*:\\s*[^=;\\n]*\\bRx(?:Func)?\\s*<\\s*(${typeArgPattern})\\s*>`),
-    // `foo = this.newRx<T>(...);` or `foo = newRx<T>(...);`
-    new RegExp(`^${escaped}(?:[!?])?\\s*=\\s*(?:this\\.)?newRx(?:Func)?\\s*<\\s*(${typeArgPattern})\\s*>`)
-  ];
-
-  for (const pattern of patterns) {
-    const match = pattern.exec(tail);
-    if (match && match[1]) {
-      const matchedTypeArg = match[1];
-      const matchedStartInTail = match.index || 0;
-      const matchedInWhole = match[0].indexOf(matchedTypeArg);
-      const absTypeArgStart = startOffset + matchedStartInTail + matchedInWhole;
-      const absTypeArgEnd = absTypeArgStart + matchedTypeArg.length;
-
-      if (matchedTypeArg === "any") {
-        return { typeName: "any" };
-      }
-
-      if (matchedTypeArg.startsWith("{")) {
-        return {
-          inlineTypeLiteralRange: {
-            startOffset: absTypeArgStart,
-            endOffset: absTypeArgEnd
-          }
-        };
-      }
-
-      return { typeName: matchedTypeArg };
-    }
-  }
-
-  return null;
-}
-
-function getContextKey(context) {
-  return `${context.document.uri.toString()}::${context.classRange.start.line}:${context.classRange.start.character}`;
-}
-
-function uniqueContexts(contexts) {
-  const result = [];
-  const seen = new Set();
-  for (const context of contexts) {
-    const key = getContextKey(context);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    result.push(context);
-  }
-  return result;
-}
-
 function parseOwnerAccessorExpression(expression) {
   const normalized = normalizeRepeatExpression(expression || "");
   const match = normalized.match(RE_OWNER_CHAIN_EXACT);
@@ -1368,266 +998,234 @@ function parseOwnerAccessorExpression(expression) {
   };
 }
 
-async function resolveMemberSegmentsFromContexts(contexts, segments) {
-  if (!contexts || !contexts.length || !segments || !segments.length) {
-    return [];
+function resolveCruzoChainBase(document, classNode, rawTemplate, relativeOffset, owner) {
+  const repeatParsed = cruzoTS.getRepeatParsedChain(rawTemplate, relativeOffset, parseOwnerAccessorExpression);
+  const thisType = cruzoTS.getThisTypeFromRepeat(document, classNode, repeatParsed);
+  const mainChk = cruzoTS.getTypeChecker(document);
+  if (owner === "root") {
+    return { checker: mainChk, baseType: cruzoTS.getRootType(mainChk, classNode) };
   }
-
-  let currentContexts = contexts;
-  let sourceContexts = currentContexts;
-  let sourceMemberName = null;
-
-  for (const segment of segments) {
-    if (segment.kind === "member") {
-      sourceContexts = currentContexts;
-      sourceMemberName = segment.name;
-      currentContexts = await resolveContextsByMemberName(currentContexts, segment.name);
-    } else if (segment.kind === "rx") {
-      currentContexts = await resolveRxValueContexts(currentContexts, sourceContexts, sourceMemberName);
-    }
-
-    if (!currentContexts.length) {
-      return [];
-    }
+  if (owner === "this") {
+    return { checker: mainChk, baseType: thisType };
   }
-
-  return currentContexts;
+  const binding = cruzoTS.findLetBindingForName(rawTemplate, relativeOffset, owner);
+  if (!binding || !binding.expr) {
+    return null;
+  }
+  const scopeRepeat = cruzoTS.getRepeatParsedChain(rawTemplate, binding.scopeOffset, parseOwnerAccessorExpression);
+  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
+  const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+  if (!probe) {
+    return null;
+  }
+  return { checker: probe.checker, baseType: probe.type };
 }
 
-async function getThisContextsFromRepeatChain(document, position, templateTarget, classRange) {
-  if (!classRange) {
-    return [];
-  }
+function tsApiNodePrimaryLocation(node) {
+  const sf = node.getSourceFile();
+  const uri = vscode.Uri.file(sf.fileName);
+  const start = node.getStart(sf);
+  const end = node.getEnd();
+  const s = sf.getLineAndCharacterOfPosition(start);
+  const e = sf.getLineAndCharacterOfPosition(end);
+  return new vscode.Location(
+    uri,
+    new vscode.Range(new vscode.Position(s.line, s.character), new vscode.Position(e.line, e.character))
+  );
+}
 
+function tsApiSymbolToDefinitionLocations(symbol) {
+  const decls = symbol.getDeclarations() || [];
+  const out = [];
+  const seen = new Set();
+  for (const d of decls) {
+    const k = `${d.getSourceFile().fileName}@${d.getStart(d.getSourceFile())}`;
+    if (seen.has(k)) {
+      continue;
+    }
+    seen.add(k);
+    out.push(tsApiNodePrimaryLocation(d));
+  }
+  return out;
+}
+
+function completionKindForTsSymbol(tsApi, symbol) {
+  const flags = symbol.flags;
+  if (flags & tsApi.SymbolFlags.EnumMember) {
+    return vscode.CompletionItemKind.EnumMember;
+  }
+  if (flags & tsApi.SymbolFlags.Enum) {
+    return vscode.CompletionItemKind.Enum;
+  }
+  if (flags & tsApi.SymbolFlags.Class) {
+    return vscode.CompletionItemKind.Class;
+  }
+  if (flags & tsApi.SymbolFlags.Method) {
+    return vscode.CompletionItemKind.Method;
+  }
+  if (flags & tsApi.SymbolFlags.Function) {
+    return vscode.CompletionItemKind.Function;
+  }
+  if (flags & tsApi.SymbolFlags.GetAccessor || flags & tsApi.SymbolFlags.SetAccessor) {
+    return vscode.CompletionItemKind.Property;
+  }
+  if (flags & tsApi.SymbolFlags.Property) {
+    return vscode.CompletionItemKind.Property;
+  }
+  return vscode.CompletionItemKind.Field;
+}
+
+function cruzeResolveAccessorDefinition(document, classNode, templateTarget, position, accessorMember) {
   const raw = templateTarget.raw;
-  const absoluteOffset = document.offsetAt(position);
-  const templateStart = document.offsetAt(templateTarget.range.start);
-  const relativeOffset = absoluteOffset - templateStart;
-  const repeatChain = getRepeatExpressionChain(raw, relativeOffset);
-
-  const rootContexts = [{ document, classRange }];
-  let thisContexts = rootContexts;
-
-  if (!repeatChain.length) {
-    return thisContexts;
-  }
-
-  for (const repeatExpression of repeatChain) {
-    const parsed = parseOwnerAccessorExpression(repeatExpression);
-    if (!parsed) {
-      continue;
-    }
-
-    const baseContexts = parsed.owner === "root" ? rootContexts : thisContexts;
-    if (!baseContexts.length) {
-      thisContexts = [];
-      continue;
-    }
-
-    thisContexts = await resolveMemberSegmentsFromContexts(baseContexts, parsed.segments);
-  }
-
-  return uniqueContexts(thisContexts);
-}
-
-function collectMembersFromContexts(contexts) {
-  const result = [];
-  const seenMembers = new Set();
-  for (const context of contexts) {
-    const members = collectComponentMembers(context.document).filter((member) =>
-      context.classRange.contains(member.range.start)
-    );
-    for (const member of members) {
-      if (seenMembers.has(member.name)) {
-        continue;
-      }
-      seenMembers.add(member.name);
-      result.push(member);
-    }
-  }
-  return result;
-}
-
-function resolveContextsByTypeName(contexts, typeName) {
-  const resolved = [];
-
-  for (const context of contexts) {
-    const ranges = findTypeBodyRangesByName(context.document, typeName);
-    for (const range of ranges) {
-      resolved.push({ document: context.document, classRange: range });
-    }
-  }
-
-  return uniqueContexts(resolved);
-}
-
-async function resolveContextsByMemberName(contexts, memberName) {
-  const nextContexts = [];
-
-  for (const context of contexts) {
-    const resolved = await getMemberTypeContexts(context.document, memberName, context.classRange);
-    nextContexts.push(...resolved);
-  }
-
-  return uniqueContexts(nextContexts);
-}
-
-async function resolveRxValueContexts(contexts, sourceContexts, sourceMemberName) {
-  if (!sourceContexts || !sourceContexts.length || !sourceMemberName) {
-    return resolveContextsByMemberName(contexts, "actual");
-  }
-
-  const typeNames = new Set();
-  let hasAny = false;
-  const inlineContexts = [];
-  for (const sourceContext of sourceContexts) {
-    const declarations = findMemberDeclarations(
-      sourceContext.document,
-      sourceMemberName,
-      sourceContext.classRange
-    );
-    for (const declaration of declarations) {
-      const rxGenericInfo = extractRxGenericTypeName(
-        sourceContext.document,
-        declaration,
-        sourceMemberName
-      );
-      if (rxGenericInfo) {
-        if (rxGenericInfo.typeName) {
-          const typeName = rxGenericInfo.typeName;
-          if (typeName === "any") {
-            hasAny = true;
-          } else {
-            typeNames.add(typeName);
-          }
-        } else if (rxGenericInfo.inlineTypeLiteralRange) {
-          inlineContexts.push({
-            document: sourceContext.document,
-            classRange: new vscode.Range(
-              sourceContext.document.positionAt(rxGenericInfo.inlineTypeLiteralRange.startOffset),
-              sourceContext.document.positionAt(rxGenericInfo.inlineTypeLiteralRange.endOffset)
-            )
-          });
-        }
-      }
-    }
-  }
-
-  // `Rx<any>` can't be unwrapped into a concrete type declaration; fall back to
-  // member resolution via `Rx['actual']` instead.
-  if (!typeNames.size && !inlineContexts.length && hasAny) {
-    return resolveContextsByMemberName(contexts, "actual");
-  }
-
-  let resolved = [];
-  for (const typeName of typeNames) {
-    resolved = resolved.concat(resolveContextsByTypeName(sourceContexts, typeName));
-  }
-
-  if (inlineContexts.length) {
-    resolved = resolved.concat(inlineContexts);
-  }
-
-  if (resolved.length) {
-    return uniqueContexts(resolved);
-  }
-
-  return resolveContextsByMemberName(contexts, "actual");
-}
-
-async function collectMemberTypeMembers(document, memberSegments, classRange) {
-  if (!memberSegments || !memberSegments.length) {
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const ctx = resolveCruzoChainBase(document, classNode, raw, rel, accessorMember.owner);
+  if (!ctx) {
     return [];
   }
-
-  let contexts = [{ document, classRange }];
-  let sourceContexts = contexts;
-  let sourceMemberName = null;
-  for (const segment of memberSegments) {
-    if (segment.kind === "member") {
-      sourceContexts = contexts;
-      sourceMemberName = segment.name;
-      contexts = await resolveContextsByMemberName(contexts, segment.name);
-    } else if (segment.kind === "rx") {
-      contexts = await resolveRxValueContexts(contexts, sourceContexts, sourceMemberName);
-    }
-
-    if (!contexts.length) {
-      return [];
-    }
-  }
-
-  const result = [];
-  const seenMembers = new Set();
-
-  for (const context of contexts) {
-    const members = collectComponentMembers(context.document).filter((member) =>
-      context.classRange.contains(member.range.start)
-    );
-    for (const member of members) {
-      if (seenMembers.has(member.name)) {
-        continue;
-      }
-      seenMembers.add(member.name);
-      result.push(member);
-    }
-  }
-
-  return result;
-}
-
-async function resolveAccessorSegmentDeclarations(document, accessorMember, classRange) {
-  const targetSegmentIndex = typeof accessorMember.targetSegmentIndex === "number"
-    ? accessorMember.targetSegmentIndex
-    : null;
-  const segments = accessorMember.segments && accessorMember.segments.length
-    ? accessorMember.segments
-    : null;
-  if (!segments || targetSegmentIndex === null) {
-    return findMemberDeclarations(document, accessorMember.name, classRange).map((range) => ({
-      document,
-      range
-    }));
-  }
-
-  let contexts = [{ document, classRange }];
-  let sourceContexts = contexts;
-  let sourceMemberName = null;
-  for (let i = 0; i < targetSegmentIndex; i += 1) {
-    const segment = segments[i];
-    if (segment.kind === "member") {
-      sourceContexts = contexts;
-      sourceMemberName = segment.name;
-      contexts = await resolveContextsByMemberName(contexts, segment.name);
-    } else if (segment.kind === "rx") {
-      contexts = await resolveRxValueContexts(contexts, sourceContexts, sourceMemberName);
-    }
-
-    if (!contexts.length) {
-      return [];
-    }
-  }
-
-  const target = segments[targetSegmentIndex];
-  if (!target || target.kind !== "member") {
+  const { checker, baseType } = ctx;
+  const idx = accessorMember.targetSegmentIndex;
+  const segments = accessorMember.segments || [];
+  if (typeof idx !== "number" || idx < 0) {
     return [];
   }
-
-  const result = [];
-  const seenRanges = new Set();
-  for (const context of contexts) {
-    const declarations = findMemberDeclarations(context.document, target.name, context.classRange);
-    for (const range of declarations) {
-      const key = `${context.document.uri.toString()}::${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`;
-      if (seenRanges.has(key)) {
-        continue;
-      }
-      seenRanges.add(key);
-      result.push({ document: context.document, range });
-    }
+  const targetSeg = segments[idx];
+  if (!targetSeg || targetSeg.kind !== "member" || !targetSeg.name) {
+    return [];
   }
+  const prefix = segments.slice(0, idx);
+  const parentType = cruzoTS.resolveChainType(checker, baseType, prefix);
+  if (!parentType) {
+    return [];
+  }
+  const sym = cruzoTS.getPropertySymbol(checker, parentType, targetSeg.name);
+  if (!sym) {
+    return [];
+  }
+  return tsApiSymbolToDefinitionLocations(sym);
+}
 
-  return result;
+function cruzePropertyCompletionsFromChain(document, classNode, templateTarget, position, ownerMember) {
+  const raw = templateTarget.raw;
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const ctx = resolveCruzoChainBase(document, classNode, raw, rel, ownerMember.owner);
+  if (!ctx) {
+    return [];
+  }
+  const { checker, baseType } = ctx;
+  const tailType = cruzoTS.resolveChainType(checker, baseType, ownerMember.segments);
+  if (!tailType) {
+    return [];
+  }
+  const props = cruzoTS.getPropertiesOfType(checker, tailType);
+  const tsApi = cruzoTS.ts;
+  return props.map((sym) => {
+    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
+    item.detail = `${ownerMember.owner} · TypeScript`;
+    return item;
+  });
+}
+
+function cruzeHoverForAccessor(document, classNode, templateTarget, position, accessorMember) {
+  const raw = templateTarget.raw;
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const ctx = resolveCruzoChainBase(document, classNode, raw, rel, accessorMember.owner);
+  if (!ctx) {
+    return null;
+  }
+  const { checker, baseType } = ctx;
+  const idx = accessorMember.targetSegmentIndex;
+  const segments = accessorMember.segments || [];
+  const targetSeg = segments[idx];
+  if (!targetSeg || targetSeg.kind !== "member" || !targetSeg.name) {
+    return null;
+  }
+  const prefix = segments.slice(0, idx);
+  const parentType = cruzoTS.resolveChainType(checker, baseType, prefix);
+  if (!parentType) {
+    return null;
+  }
+  const sym = cruzoTS.getPropertySymbol(checker, parentType, targetSeg.name);
+  if (!sym) {
+    return null;
+  }
+  const typ = checker.getTypeOfSymbol(sym);
+  const typeStr = cruzoTS.typeToStringSafe(checker, typ);
+  const jsdoc = cruzoTS.getSymbolDocumentation(checker, sym);
+  const md = new vscode.MarkdownString();
+  md.appendMarkdown(`**${sym.name}**`);
+  md.appendMarkdown(`\n\n\`\`\`typescript\n${typeStr}\n\`\`\``);
+  if (jsdoc) {
+    md.appendMarkdown(`\n\n${jsdoc}`);
+  }
+  return new vscode.Hover(md);
+}
+
+function cruzeRootTopLevelCompletions(document, classNode) {
+  const mainChk = cruzoTS.getTypeChecker(document);
+  const rootType = cruzoTS.getRootType(mainChk, classNode);
+  const props = cruzoTS.getPropertiesOfType(mainChk, rootType);
+  const tsApi = cruzoTS.ts;
+  return props.map((sym) => {
+    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
+    item.detail = "root · TypeScript";
+    return item;
+  });
+}
+
+function cruzeThisTopLevelCompletions(document, classNode, templateTarget, position) {
+  const raw = templateTarget.raw;
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const repeatParsed = cruzoTS.getRepeatParsedChain(raw, rel, parseOwnerAccessorExpression);
+  const thisType = cruzoTS.getThisTypeFromRepeat(document, classNode, repeatParsed);
+  const mainChk = cruzoTS.getTypeChecker(document);
+  const props = cruzoTS.getPropertiesOfType(mainChk, thisType);
+  const tsApi = cruzoTS.ts;
+  return props.map((sym) => {
+    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
+    item.detail = "this · TypeScript";
+    return item;
+  });
+}
+
+function cruzeHoverForLetLexical(document, classNode, templateTarget, position, letName) {
+  const raw = templateTarget.raw;
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const binding = cruzoTS.findLetBindingForName(raw, rel, letName);
+  if (!binding || !binding.expr) {
+    return null;
+  }
+  const scopeRepeat = cruzoTS.getRepeatParsedChain(raw, binding.scopeOffset, parseOwnerAccessorExpression);
+  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
+  const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+  if (!probe) {
+    return null;
+  }
+  const s = cruzoTS.typeToStringSafe(probe.checker, probe.type);
+  return new vscode.Hover(
+    new vscode.MarkdownString(`**${letName}** (Cruzo lexical)\n\n\`\`\`typescript\n${s}\n\`\`\``)
+  );
+}
+
+function cruzeLetTopLevelCompletions(document, classNode, templateTarget, position, letName) {
+  const raw = templateTarget.raw;
+  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const binding = cruzoTS.findLetBindingForName(raw, rel, letName);
+  if (!binding || !binding.expr) {
+    return [];
+  }
+  const scopeRepeat = cruzoTS.getRepeatParsedChain(raw, binding.scopeOffset, parseOwnerAccessorExpression);
+  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
+  const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+  if (!probe) {
+    return [];
+  }
+  const props = cruzoTS.getPropertiesOfType(probe.checker, probe.type);
+  const tsApi = cruzoTS.ts;
+  return props.map((sym) => {
+    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
+    item.detail = `${letName} · TypeScript`;
+    return item;
+  });
 }
 
 function buildCruzoAttributeCompletions() {
@@ -1739,50 +1337,6 @@ function getCruzoHoverForWord(word) {
   return new vscode.Hover(new vscode.MarkdownString(docs[word]));
 }
 
-function normalizeHoverContents(contents) {
-  if (!contents || !contents.length) {
-    return "";
-  }
-
-  const parts = contents.map((item) => {
-    if (typeof item === "string") {
-      return item;
-    }
-    if (item instanceof vscode.MarkdownString) {
-      return item.value;
-    }
-    if (item && typeof item === "object" && "value" in item) {
-      return `\`\`\`${item.language || ""}\n${item.value}\n\`\`\``;
-    }
-    return "";
-  }).filter(Boolean);
-
-  return parts.join("\n\n");
-}
-
-async function getTypeHoverAtLocation(uri, position) {
-  try {
-    const hovers = await vscode.commands.executeCommand(
-      "vscode.executeHoverProvider",
-      uri,
-      position
-    );
-
-    if (!hovers || !hovers.length) {
-      return null;
-    }
-
-    const markdown = normalizeHoverContents(hovers[0].contents);
-    if (!markdown) {
-      return null;
-    }
-
-    return new vscode.Hover(new vscode.MarkdownString(markdown));
-  } catch {
-    return null;
-  }
-}
-
 function collectTemplateRootMemberOccurrences(document, memberName, indentSize) {
   const occurrences = [];
   const targets = getTemplateLiteralTargetsCached(document, indentSize);
@@ -1850,7 +1404,7 @@ function activate(context) {
   const getIndentSize = () => indentSize;
   const invalidateAnalysisCaches = () => {
     templateTargetsCache.clear();
-    componentMembersCache.clear();
+    cruzoTS.clearTsProgramCache();
   };
   const invalidateSelectorCache = () => {
     selectorLocationCacheRevision += 1;
@@ -1940,73 +1494,38 @@ function activate(context) {
   });
 
   const definitionProvider = vscode.languages.registerDefinitionProvider(selector, {
-    async provideDefinition(document, position) {
+    provideDefinition(document, position) {
       try {
         const templateTarget = getTemplateTargetAtPosition(document, position, getIndentSize());
         if (!templateTarget) {
           return null;
         }
 
-        const classRange = findEnclosingClassRange(document, templateTarget.range.start);
-        const accessorMember = getTemplateAccessorMemberAtPosition(document, position, templateTarget)
+        const sourceFile = cruzoTS.getSourceFile(document);
+        if (!sourceFile) {
+          return null;
+        }
+        const classNode = cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start));
+        if (!classNode) {
+          return null;
+        }
+
+        const accessorMember =
+          getTemplateAccessorMemberAtPosition(document, position, templateTarget)
           || getRootMemberAtPosition(document, position, templateTarget);
         if (accessorMember) {
-          const declarationCandidates = await resolveAccessorSegmentDeclarations(
-            document,
-            accessorMember,
-            classRange
-          );
-          if (declarationCandidates.length) {
-            return declarationCandidates.map((candidate) =>
-              new vscode.Location(candidate.document.uri, candidate.range)
-            );
-          }
-
-          const targetSegmentIndex = typeof accessorMember.targetSegmentIndex === "number"
-            ? accessorMember.targetSegmentIndex
-            : 0;
-          if (targetSegmentIndex === 0 && accessorMember.owner === "this") {
-            const thisContexts = await getThisContextsFromRepeatChain(
-              document,
-              position,
-              templateTarget,
-              classRange
-            );
-            const thisDeclarationCandidates = [];
-            const seen = new Set();
-            for (const context of thisContexts) {
-              const declarationRanges = findMemberDeclarations(context.document, accessorMember.name, context.classRange);
-              for (const range of declarationRanges) {
-                const key = `${context.document.uri.toString()}::${range.start.line}:${range.start.character}`;
-                if (seen.has(key)) {
-                  continue;
-                }
-                seen.add(key);
-                thisDeclarationCandidates.push(new vscode.Location(context.document.uri, range));
-              }
-            }
-            if (thisDeclarationCandidates.length) {
-              return thisDeclarationCandidates;
-            }
-
-            const repeatMemberDefinitions = findThisRepeatMemberDefinitions(
-              document,
-              position,
-              templateTarget,
-              accessorMember.name,
-              classRange
-            );
-            if (repeatMemberDefinitions.length) {
-              return repeatMemberDefinitions.map((range) => new vscode.Location(document.uri, range));
-            }
+          const locs = cruzeResolveAccessorDefinition(document, classNode, templateTarget, position, accessorMember);
+          if (locs.length) {
+            return locs;
           }
         }
 
-      const letMember = getLetMemberAtPosition(document, position, templateTarget);
-      if (letMember) {
-        return [new vscode.Location(document.uri, letMember.declarationRange)];
-      }
+        const letMember = getLetMemberAtPosition(document, position, templateTarget);
+        if (letMember) {
+          return [new vscode.Location(document.uri, letMember.declarationRange)];
+        }
 
+        const classRange = findEnclosingClassRange(document, templateTarget.range.start);
         const wordRange = getWordRangeAtPosition(document, position);
         if (!wordRange) {
           return null;
@@ -2125,51 +1644,42 @@ function activate(context) {
   const completionProvider = vscode.languages.registerCompletionItemProvider(
     selector,
     {
-      async provideCompletionItems(document, position) {
+      provideCompletionItems(document, position) {
         const templateTarget = getTemplateTargetAtPosition(document, position, getIndentSize());
         if (!templateTarget) {
           return null;
         }
-        const classRange = findEnclosingClassRange(document, templateTarget.range.start);
+        const sourceFile = cruzoTS.getSourceFile(document);
+        if (!sourceFile) {
+          return null;
+        }
+        const classNode = cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start));
+        if (!classNode) {
+          return null;
+        }
 
-        const ownerMember = getCompletionOwnerMemberForPosition(document, position);
+        const ownerMember = getCompletionOwnerMemberForPosition(document, position, templateTarget);
         if (ownerMember) {
-          let nestedMembers = [];
-          if (ownerMember.owner === "this") {
-            const thisContexts = await getThisContextsFromRepeatChain(document, position, templateTarget, classRange);
-            const nestedContexts = await resolveMemberSegmentsFromContexts(thisContexts, ownerMember.segments);
-            nestedMembers = collectMembersFromContexts(nestedContexts);
-          } else {
-            nestedMembers = await collectMemberTypeMembers(document, ownerMember.segments, classRange);
-          }
-          if (nestedMembers.length) {
-            return nestedMembers.map((member) => {
-              const item = new vscode.CompletionItem(member.name, member.kind);
-              item.detail = `${ownerMember.owner} member class property`;
-              return item;
-            });
+          const items = cruzePropertyCompletionsFromChain(document, classNode, templateTarget, position, ownerMember);
+          if (items.length) {
+            return items;
           }
         }
 
-        const owner = getExpressionOwnerForCompletion(document, position);
+        const owner = getExpressionOwnerForCompletion(document, position, templateTarget);
         if (owner === "root") {
-          const members = collectComponentMembers(document);
-          return members.map((member) => {
-            const item = new vscode.CompletionItem(member.name, member.kind);
-            item.detail = "Cruzo component member";
-            return item;
-          });
-        } else if (owner === "this") {
-          const thisContexts = await getThisContextsFromRepeatChain(document, position, templateTarget, classRange);
-          const thisMembers = collectMembersFromContexts(thisContexts);
-          if (thisMembers.length) {
-            return thisMembers.map((member) => {
-              const item = new vscode.CompletionItem(member.name, member.kind);
-              item.detail = "Cruzo context member";
-              return item;
-            });
+          return cruzeRootTopLevelCompletions(document, classNode);
+        }
+        if (owner === "this") {
+          return cruzeThisTopLevelCompletions(document, classNode, templateTarget, position);
+        }
+        if (owner) {
+          const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+          const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
+          if (activeLets.has(owner)) {
+            return cruzeLetTopLevelCompletions(document, classNode, templateTarget, position, owner);
           }
-        }        
+        }
 
         const lineText = document.lineAt(position.line).text.slice(0, position.character);
         if (RE_ATTR_CONTEXT.test(lineText)) {
@@ -2183,61 +1693,24 @@ function activate(context) {
   );
 
   const hoverProvider = vscode.languages.registerHoverProvider(selector, {
-    async provideHover(document, position) {
+    provideHover(document, position) {
       const templateTarget = getTemplateTargetAtPosition(document, position, getIndentSize());
       if (!templateTarget) {
         return null;
       }
 
-      const classRange = findEnclosingClassRange(document, templateTarget.range.start);
-      const accessorMember = getTemplateAccessorMemberAtPosition(document, position, templateTarget);
-      if (accessorMember) {
-        const declarationCandidates = await resolveAccessorSegmentDeclarations(
-          document,
-          accessorMember,
-          classRange
-        );
-        const targetSegmentIndex = typeof accessorMember.targetSegmentIndex === "number"
-          ? accessorMember.targetSegmentIndex
-          : 0;
+      const sourceFile = cruzoTS.getSourceFile(document);
+      const classNode = sourceFile
+        ? cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start))
+        : null;
 
-        for (const candidate of declarationCandidates) {
-          const typeHover = await getTypeHoverAtLocation(candidate.document.uri, candidate.range.start);
-          if (typeHover) {
-            return typeHover;
-          }
-        }
-
-        if (targetSegmentIndex === 0 && accessorMember.owner === "this") {
-          const thisContexts = await getThisContextsFromRepeatChain(
-            document,
-            position,
-            templateTarget,
-            classRange
-          );
-          for (const context of thisContexts) {
-            const declarations = findMemberDeclarations(context.document, accessorMember.name, context.classRange);
-            for (const declaration of declarations) {
-              const typeHover = await getTypeHoverAtLocation(context.document.uri, declaration.start);
-              if (typeHover) {
-                return typeHover;
-              }
-            }
-          }
-
-          const repeatMemberDefinitions = findThisRepeatMemberDefinitions(
-            document,
-            position,
-            templateTarget,
-            accessorMember.name,
-            classRange
-          );
-          if (repeatMemberDefinitions.length) {
-            const declarationLine = document.lineAt(repeatMemberDefinitions[0].start.line).text.trim();
-            return new vscode.Hover(
-              new vscode.MarkdownString(`Repeat item field \`${accessorMember.name}\`\n\n\`${declarationLine}\``)
-            );
-          }
+      const accessorMember =
+        getTemplateAccessorMemberAtPosition(document, position, templateTarget)
+        || getRootMemberAtPosition(document, position, templateTarget);
+      if (accessorMember && classNode) {
+        const h = cruzeHoverForAccessor(document, classNode, templateTarget, position, accessorMember);
+        if (h) {
+          return h;
         }
       }
 
@@ -2251,7 +1724,11 @@ function activate(context) {
       }
 
       const letMember = getLetMemberAtPosition(document, position, templateTarget);
-      if (letMember) {
+      if (letMember && classNode) {
+        const h = cruzeHoverForLetLexical(document, classNode, templateTarget, position, letMember.name);
+        if (h) {
+          return h;
+        }
         const declarationLine = document.lineAt(letMember.declarationRange.start.line).text.trim();
         return new vscode.Hover(
           new vscode.MarkdownString(`Cruzo lexical variable \`${letMember.name}\`\n\n\`${declarationLine}\``)
