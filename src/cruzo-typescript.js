@@ -70,7 +70,13 @@ function getVirtualScriptExtension(document) {
 /** @type {Map<string, { program: import('typescript').Program, rootNames: string[], options: import('typescript').CompilerOptions, configPath: string | null, mtime: number }>} */
 const programCache = new Map();
 
+const MAX_PROGRAM_CACHE = 12;
+
 const VIRTUAL_SUFFIX = ".__cruzo_virtual__";
+
+const RE_TEMPLATE_OPEN_TAG = /^<\s*([A-Za-z][\w:-]*)/;
+const RE_TEMPLATE_CLOSE_TAG = /^<\s*\/\s*([A-Za-z][\w:-]*)/;
+const RE_REPEAT_ATTR = /\brepeat\s*=\s*(?:"([^"]*)"|'([^']*)')/;
 
 /**
  * @param {string} filePath
@@ -152,13 +158,12 @@ function getConfigMtime(configPath) {
 
 /**
  * @param {import('vscode').TextDocument} document
+ * @param {string | undefined} configPath
  */
-function getProgramCacheKey(document) {
-  const folder = vscode.workspace.getWorkspaceFolder(document.uri);
-  const docPath = getDocumentFsPath(document);
-  const configPath = findConfigPath(folder, docPath) || "";
-  const mtime = configPath ? getConfigMtime(configPath) : 0;
-  return `${document.uri.toString()}::v${document.version}::${configPath}::${mtime}`;
+function getProgramCacheKey(document, configPath) {
+  const cfg = configPath || "";
+  const mtime = cfg ? getConfigMtime(cfg) : 0;
+  return `${document.uri.toString()}::v${document.version}::${cfg}::${mtime}`;
 }
 
 /**
@@ -168,7 +173,7 @@ function getBaseCompilerSetup(document) {
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
   const docPath = getDocumentFsPath(document);
   const configPath = findConfigPath(folder, docPath);
-  const cacheKey = getProgramCacheKey(document);
+  const cacheKey = getProgramCacheKey(document, configPath);
   const cached = programCache.get(cacheKey);
   if (cached) {
     return cached;
@@ -227,11 +232,55 @@ function getBaseCompilerSetup(document) {
     configPath: configPath || null,
     mtime: configPath ? getConfigMtime(configPath) : 0
   };
-  if (programCache.size > 8) {
-    programCache.clear();
+  if (programCache.size >= MAX_PROGRAM_CACHE) {
+    const oldest = programCache.keys().next().value;
+    if (oldest !== undefined) {
+      programCache.delete(oldest);
+    }
   }
   programCache.set(cacheKey, entry);
   return entry;
+}
+
+/**
+ * Single-pass scan of template HTML tags up to and including `untilOffset`.
+ * @param {string} rawTemplate
+ * @param {number} untilOffset
+ * @param {{ onOpen?: (tagStart: number, tagText: string, tagNameLower: string, selfClosing: boolean) => void, onClose?: (tagNameLower: string) => void }} visitor
+ */
+function walkTemplateTagsUntil(rawTemplate, untilOffset, visitor) {
+  let cursor = 0;
+  while (cursor < rawTemplate.length) {
+    const tagStart = rawTemplate.indexOf("<", cursor);
+    if (tagStart === -1 || tagStart > untilOffset) {
+      break;
+    }
+    const tagEnd = findTagEndIndexInTemplateText(rawTemplate, tagStart);
+    if (tagEnd === -1) {
+      break;
+    }
+    const tagText = rawTemplate.slice(tagStart, tagEnd + 1);
+    cursor = tagEnd + 1;
+
+    if (/^<!--/.test(tagText)) {
+      continue;
+    }
+
+    const closeMatch = tagText.match(RE_TEMPLATE_CLOSE_TAG);
+    if (closeMatch) {
+      visitor.onClose?.(closeMatch[1].toLowerCase());
+      continue;
+    }
+
+    const openMatch = tagText.match(RE_TEMPLATE_OPEN_TAG);
+    if (!openMatch) {
+      continue;
+    }
+
+    const tagNameLower = openMatch[1].toLowerCase();
+    const selfClosing = /\/\s*>$/.test(tagText) || VOID_HTML_ELEMENTS.has(tagNameLower);
+    visitor.onOpen?.(tagStart, tagText, tagNameLower, selfClosing);
+  }
 }
 
 function clearTsProgramCache() {
@@ -397,22 +446,6 @@ function getIterationElementType(checker, type) {
   }
 
   return undefined;
-}
-
-/**
- * @param {{ kind: string, name?: string | null }} segment
- */
-function segmentKey(segment) {
-  if (segment.kind === "rx") {
-    return "rx";
-  }
-  if (segment.kind === "member" && segment.name) {
-    return `m:${segment.name}`;
-  }
-  if (segment.kind === "index") {
-    return "i";
-  }
-  return "";
 }
 
 /**
@@ -591,20 +624,6 @@ function createProgramWithVirtualFile(document, virtualBody) {
 }
 
 /**
- * @param {import('typescript').Program} program
- * @param {string} virtualPath
- * @param {string} sourceText
- * @param {number} offset
- */
-function getNodeAtOffsetInVirtual(program, virtualPath, sourceText, offset) {
-  const sf = program.getSourceFile(virtualPath);
-  if (!sf) {
-    return null;
-  }
-  return ts.getTokenAtPosition(sf, offset);
-}
-
-/**
  * @returns {{ checker: import('typescript').TypeChecker, type: import('typescript').Type, program: import('typescript').Program } | null}
  */
 function getExpressionType(document, classNode, thisType, expression) {
@@ -681,50 +700,23 @@ function extractLetBindingsFromTag(tagText, tagStartOffsetInRaw, relativeOffset)
  */
 function getActiveLetBindingMap(rawTemplate, relativeOffset) {
   const stack = [];
-  let cursor = 0;
-
-  while (cursor < rawTemplate.length) {
-    const tagStart = rawTemplate.indexOf("<", cursor);
-    if (tagStart === -1 || tagStart > relativeOffset) {
-      break;
-    }
-    const tagEnd = findTagEndIndexInTemplateText(rawTemplate, tagStart);
-    if (tagEnd === -1) {
-      break;
-    }
-    const tagText = rawTemplate.slice(tagStart, tagEnd + 1);
-    cursor = tagEnd + 1;
-
-    if (/^<!--/.test(tagText)) {
-      continue;
-    }
-
-    const closeMatch = tagText.match(/^<\s*\/\s*([A-Za-z][\w:-]*)/);
-    if (closeMatch) {
-      const closeName = closeMatch[1].toLowerCase();
+  walkTemplateTagsUntil(rawTemplate, relativeOffset, {
+    onClose(closeName) {
       for (let i = stack.length - 1; i >= 0; i -= 1) {
         if (stack[i].name === closeName) {
           stack.splice(i);
           break;
         }
       }
-      continue;
+    },
+    onOpen(tagStart, tagText, tagNameLower, selfClosing) {
+      const lets = extractLetBindingsFromTag(tagText, tagStart, relativeOffset);
+      stack.push({ name: tagNameLower, lets });
+      if (selfClosing) {
+        stack.pop();
+      }
     }
-
-    const openMatch = tagText.match(/^<\s*([A-Za-z][\w:-]*)/);
-    if (!openMatch) {
-      continue;
-    }
-
-    const name = openMatch[1].toLowerCase();
-    const selfClosing = /\/\s*>$/.test(tagText) || VOID_HTML_ELEMENTS.has(name);
-    const lets = extractLetBindingsFromTag(tagText, tagStart, relativeOffset);
-    stack.push({ name, lets });
-
-    if (selfClosing) {
-      stack.pop();
-    }
-  }
+  });
 
   const active = new Map();
   for (let i = stack.length - 1; i >= 0; i -= 1) {
@@ -759,20 +751,20 @@ function getLetVariableType(document, classNode, rawTemplate, relativeOffset, le
   if (!binding || !binding.expr) {
     return null;
   }
+  const checker = getTypeChecker(document);
   const repeatChain = getRepeatParsedChain(rawTemplate, binding.scopeOffset, parseOwnerAccessorExpression);
-  const thisType = getThisTypeFromRepeat(document, classNode, repeatChain);
+  const thisType = getThisTypeFromRepeatChain(checker, classNode, repeatChain);
   const probe = getExpressionType(document, classNode, thisType, binding.expr);
   return probe ? probe.type : null;
 }
 
 /**
- * @param {import('vscode').TextDocument} document
+ * @param {import('typescript').TypeChecker} checker
  * @param {import('typescript').ClassLikeDeclaration} classNode
  * @param {Array<{ owner: string, segments: Array<{ kind: string, name?: string | null }> }>} repeatParsedChain
  */
-function getThisTypeFromRepeat(document, classNode, repeatParsedChain) {
-  const checker = getTypeChecker(document);
-  let rootType = getRootType(checker, classNode);
+function getThisTypeFromRepeatChain(checker, classNode, repeatParsedChain) {
+  const rootType = getRootType(checker, classNode);
   let thisType = rootType;
 
   if (!repeatParsedChain.length) {
@@ -799,67 +791,49 @@ function getThisTypeFromRepeat(document, classNode, repeatParsedChain) {
 }
 
 /**
+ * @param {import('vscode').TextDocument} document
+ * @param {import('typescript').ClassLikeDeclaration} classNode
+ * @param {Array<{ owner: string, segments: Array<{ kind: string, name?: string | null }> }>} repeatParsedChain
+ */
+function getThisTypeFromRepeat(document, classNode, repeatParsedChain) {
+  return getThisTypeFromRepeatChain(getTypeChecker(document), classNode, repeatParsedChain);
+}
+
+/**
  * Parse repeat expressions from root template up to relativeOffset (same logic as extension).
  * @param {string} rawTemplate
  * @param {number} relativeOffset
  * @param {(expr: string) => { owner: string, segments: any[] } | null} parseOwnerAccessorExpression
  */
 function getRepeatParsedChain(rawTemplate, relativeOffset, parseOwnerAccessorExpression) {
-  const RE_REPEAT_ATTR = /\brepeat\s*=\s*(?:"([^"]*)"|'([^']*)')/;
   const stack = [];
-  let cursor = 0;
-
-  while (cursor < rawTemplate.length) {
-    const tagStart = rawTemplate.indexOf("<", cursor);
-    if (tagStart === -1 || tagStart > relativeOffset) {
-      break;
-    }
-    const tagEnd = findTagEndIndexInTemplateText(rawTemplate, tagStart);
-    if (tagEnd === -1) {
-      break;
-    }
-    const tagText = rawTemplate.slice(tagStart, tagEnd + 1);
-    cursor = tagEnd + 1;
-
-    if (/^<!--/.test(tagText)) {
-      continue;
-    }
-
-    const closeMatch = tagText.match(/^<\s*\/\s*([A-Za-z][\w:-]*)/);
-    if (closeMatch) {
-      const closeName = closeMatch[1].toLowerCase();
+  walkTemplateTagsUntil(rawTemplate, relativeOffset, {
+    onClose(closeName) {
       for (let i = stack.length - 1; i >= 0; i -= 1) {
         if (stack[i].name === closeName) {
           stack.splice(i);
           break;
         }
       }
-      continue;
+    },
+    onOpen(_tagStart, tagText, tagNameLower, selfClosing) {
+      const repeatMatch = tagText.match(RE_REPEAT_ATTR);
+      const repeatExpression = repeatMatch
+        ? normalizeMustacheExpression(repeatMatch[1] || repeatMatch[2] || "")
+        : null;
+      stack.push({ name: tagNameLower, repeatExpression });
+      if (selfClosing) {
+        stack.pop();
+      }
     }
+  });
 
-    const openMatch = tagText.match(/^<\s*([A-Za-z][\w:-]*)/);
-    if (!openMatch) {
-      continue;
-    }
-
-    const name = openMatch[1].toLowerCase();
-    const selfClosing = /\/\s*>$/.test(tagText) || VOID_HTML_ELEMENTS.has(name);
-    const repeatMatch = tagText.match(RE_REPEAT_ATTR);
-    const repeatExpression = repeatMatch
-      ? normalizeMustacheExpression(repeatMatch[1] || repeatMatch[2] || "")
-      : null;
-
-    stack.push({ name, repeatExpression });
-
-    if (selfClosing) {
-      stack.pop();
-    }
-  }
-
-  const chain = stack.map((x) => x.repeatExpression).filter(Boolean);
   const parsed = [];
-  for (const expr of chain) {
-    const p = parseOwnerAccessorExpression(expr);
+  for (const x of stack) {
+    if (!x.repeatExpression) {
+      continue;
+    }
+    const p = parseOwnerAccessorExpression(x.repeatExpression);
     if (p) {
       parsed.push(p);
     }
@@ -877,6 +851,7 @@ module.exports = {
   getEnclosingClassNode,
   getRootType,
   getThisTypeFromRepeat,
+  getThisTypeFromRepeatChain,
   getLetVariableType,
   findLetBindingForName,
   getActiveLetBindingMap,
@@ -893,8 +868,6 @@ module.exports = {
   ensureRootDeclaration,
   buildThisDecl,
   createProgramWithVirtualFile,
-  getNodeAtOffsetInVirtual,
-  segmentKey,
   getRepeatParsedChain,
   moduleSpecifierRelative
 };

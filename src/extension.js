@@ -897,11 +897,23 @@ function getTextBeforePosition(document, position, maxChars = 160) {
   return lineText.slice(start, position.character);
 }
 
-function getExpressionOwnerForCompletion(document, position, templateTarget) {
+function cruzeTemplateRelOffset(document, templateTarget, position) {
+  return document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+}
+
+function cruzeSortedLetNames(activeLetsMap) {
+  return [...activeLetsMap.keys()].sort((a, b) => b.length - a.length);
+}
+
+function getExpressionOwnerForCompletion(document, position, templateTarget, activeLetsMap) {
   const before = getTextBeforePosition(document, position);
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-  const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
-  const letNames = [...activeLets.keys()].sort((a, b) => b.length - a.length);
+  const activeLets =
+    activeLetsMap
+    || cruzoTS.getActiveLetBindingMap(
+      templateTarget.raw,
+      cruzeTemplateRelOffset(document, templateTarget, position)
+    );
+  const letNames = cruzeSortedLetNames(activeLets);
   const ownersPattern = ["root", "this", ...letNames.map(escapeRegExp)].join("|");
   const ownerRe = new RegExp(
     `(?:^|[^\\w$])(${ownersPattern})(?:\\s*::rx)?\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$\\w$]*$`
@@ -910,11 +922,15 @@ function getExpressionOwnerForCompletion(document, position, templateTarget) {
   return ownerMatch ? ownerMatch[1] : null;
 }
 
-function getCompletionOwnerMemberForPosition(document, position, templateTarget) {
+function getCompletionOwnerMemberForPosition(document, position, templateTarget, activeLetsMap) {
   const before = getTextBeforePosition(document, position);
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-  const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
-  const letNames = [...activeLets.keys()].sort((a, b) => b.length - a.length);
+  const activeLets =
+    activeLetsMap
+    || cruzoTS.getActiveLetBindingMap(
+      templateTarget.raw,
+      cruzeTemplateRelOffset(document, templateTarget, position)
+    );
+  const letNames = cruzeSortedLetNames(activeLets);
   const ownersPattern = ["root", "this", ...letNames.map(escapeRegExp)].join("|");
   const chainRe = new RegExp(
     `(?:^|[^\\w$])(${ownersPattern})(?:\\s*::rx)?((?:\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$][\\w$]*|\\s*\\[\\s*(?:"[^"\\n]+"|'[^'\\n]+'|\`[^\\\`\\n]+\`|\\d+)\\s*\\]|\\s*::rx)+)\\s*(?:\\?\\.|\\.)\\s*[A-Za-z_$\\w$]*$`
@@ -998,22 +1014,30 @@ function parseOwnerAccessorExpression(expression) {
   };
 }
 
+function tryGetCruzoClassNode(document, templateTarget) {
+  const sourceFile = cruzoTS.getSourceFile(document);
+  if (!sourceFile) {
+    return null;
+  }
+  return cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start));
+}
+
 function resolveCruzoChainBase(document, classNode, rawTemplate, relativeOffset, owner) {
+  const checker = cruzoTS.getTypeChecker(document);
   const repeatParsed = cruzoTS.getRepeatParsedChain(rawTemplate, relativeOffset, parseOwnerAccessorExpression);
-  const thisType = cruzoTS.getThisTypeFromRepeat(document, classNode, repeatParsed);
-  const mainChk = cruzoTS.getTypeChecker(document);
+  const thisType = cruzoTS.getThisTypeFromRepeatChain(checker, classNode, repeatParsed);
   if (owner === "root") {
-    return { checker: mainChk, baseType: cruzoTS.getRootType(mainChk, classNode) };
+    return { checker, baseType: cruzoTS.getRootType(checker, classNode) };
   }
   if (owner === "this") {
-    return { checker: mainChk, baseType: thisType };
+    return { checker, baseType: thisType };
   }
   const binding = cruzoTS.findLetBindingForName(rawTemplate, relativeOffset, owner);
   if (!binding || !binding.expr) {
     return null;
   }
   const scopeRepeat = cruzoTS.getRepeatParsedChain(rawTemplate, binding.scopeOffset, parseOwnerAccessorExpression);
-  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
+  const scopeThis = cruzoTS.getThisTypeFromRepeatChain(checker, classNode, scopeRepeat);
   const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
   if (!probe) {
     return null;
@@ -1050,63 +1074,91 @@ function tsApiSymbolToDefinitionLocations(symbol) {
 }
 
 function completionKindForTsSymbol(tsApi, symbol) {
+  const F = tsApi.SymbolFlags;
   const flags = symbol.flags;
-  if (flags & tsApi.SymbolFlags.EnumMember) {
+  if (flags & F.EnumMember) {
     return vscode.CompletionItemKind.EnumMember;
   }
-  if (flags & tsApi.SymbolFlags.Enum) {
+  if (flags & F.Enum) {
     return vscode.CompletionItemKind.Enum;
   }
-  if (flags & tsApi.SymbolFlags.Class) {
+  if (flags & F.Class) {
     return vscode.CompletionItemKind.Class;
   }
-  if (flags & tsApi.SymbolFlags.Method) {
+  if (flags & F.Method) {
     return vscode.CompletionItemKind.Method;
   }
-  if (flags & tsApi.SymbolFlags.Function) {
+  if (flags & F.Function) {
     return vscode.CompletionItemKind.Function;
   }
-  if (flags & tsApi.SymbolFlags.GetAccessor || flags & tsApi.SymbolFlags.SetAccessor) {
+  if (flags & F.GetAccessor || flags & F.SetAccessor) {
     return vscode.CompletionItemKind.Property;
   }
-  if (flags & tsApi.SymbolFlags.Property) {
+  if (flags & F.Property) {
     return vscode.CompletionItemKind.Property;
   }
   return vscode.CompletionItemKind.Field;
 }
 
-function cruzeResolveAccessorDefinition(document, classNode, templateTarget, position, accessorMember) {
-  const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+function symbolsToCompletionItems(symbols, detailPrefix) {
+  const tsApi = cruzoTS.ts;
+  return symbols.map((sym) => {
+    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
+    item.detail = detailPrefix;
+    return item;
+  });
+}
+
+function cruzeLetExpressionProbe(document, classNode, raw, rel, letName) {
+  const binding = cruzoTS.findLetBindingForName(raw, rel, letName);
+  if (!binding || !binding.expr) {
+    return null;
+  }
+  const checker = cruzoTS.getTypeChecker(document);
+  const scopeRepeat = cruzoTS.getRepeatParsedChain(raw, binding.scopeOffset, parseOwnerAccessorExpression);
+  const scopeThis = cruzoTS.getThisTypeFromRepeatChain(checker, classNode, scopeRepeat);
+  return cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+}
+
+function cruzeAccessorTargetSymbol(document, classNode, raw, rel, accessorMember) {
   const ctx = resolveCruzoChainBase(document, classNode, raw, rel, accessorMember.owner);
   if (!ctx) {
-    return [];
+    return null;
   }
   const { checker, baseType } = ctx;
   const idx = accessorMember.targetSegmentIndex;
   const segments = accessorMember.segments || [];
   if (typeof idx !== "number" || idx < 0) {
-    return [];
+    return null;
   }
   const targetSeg = segments[idx];
   if (!targetSeg || targetSeg.kind !== "member" || !targetSeg.name) {
-    return [];
+    return null;
   }
-  const prefix = segments.slice(0, idx);
-  const parentType = cruzoTS.resolveChainType(checker, baseType, prefix);
+  const parentType = cruzoTS.resolveChainType(checker, baseType, segments.slice(0, idx));
   if (!parentType) {
-    return [];
+    return null;
   }
   const sym = cruzoTS.getPropertySymbol(checker, parentType, targetSeg.name);
   if (!sym) {
+    return null;
+  }
+  return { checker, sym };
+}
+
+function cruzeResolveAccessorDefinition(document, classNode, templateTarget, position, accessorMember) {
+  const raw = templateTarget.raw;
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
+  const hit = cruzeAccessorTargetSymbol(document, classNode, raw, rel, accessorMember);
+  if (!hit) {
     return [];
   }
-  return tsApiSymbolToDefinitionLocations(sym);
+  return tsApiSymbolToDefinitionLocations(hit.sym);
 }
 
 function cruzePropertyCompletionsFromChain(document, classNode, templateTarget, position, ownerMember) {
   const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
   const ctx = resolveCruzoChainBase(document, classNode, raw, rel, ownerMember.owner);
   if (!ctx) {
     return [];
@@ -1116,38 +1168,20 @@ function cruzePropertyCompletionsFromChain(document, classNode, templateTarget, 
   if (!tailType) {
     return [];
   }
-  const props = cruzoTS.getPropertiesOfType(checker, tailType);
-  const tsApi = cruzoTS.ts;
-  return props.map((sym) => {
-    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
-    item.detail = `${ownerMember.owner} · TypeScript`;
-    return item;
-  });
+  return symbolsToCompletionItems(
+    cruzoTS.getPropertiesOfType(checker, tailType),
+    `${ownerMember.owner} · TypeScript`
+  );
 }
 
 function cruzeHoverForAccessor(document, classNode, templateTarget, position, accessorMember) {
   const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-  const ctx = resolveCruzoChainBase(document, classNode, raw, rel, accessorMember.owner);
-  if (!ctx) {
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
+  const hit = cruzeAccessorTargetSymbol(document, classNode, raw, rel, accessorMember);
+  if (!hit) {
     return null;
   }
-  const { checker, baseType } = ctx;
-  const idx = accessorMember.targetSegmentIndex;
-  const segments = accessorMember.segments || [];
-  const targetSeg = segments[idx];
-  if (!targetSeg || targetSeg.kind !== "member" || !targetSeg.name) {
-    return null;
-  }
-  const prefix = segments.slice(0, idx);
-  const parentType = cruzoTS.resolveChainType(checker, baseType, prefix);
-  if (!parentType) {
-    return null;
-  }
-  const sym = cruzoTS.getPropertySymbol(checker, parentType, targetSeg.name);
-  if (!sym) {
-    return null;
-  }
+  const { checker, sym } = hit;
   const typ = checker.getTypeOfSymbol(sym);
   const typeStr = cruzoTS.typeToStringSafe(checker, typ);
   const jsdoc = cruzoTS.getSymbolDocumentation(checker, sym);
@@ -1161,42 +1195,24 @@ function cruzeHoverForAccessor(document, classNode, templateTarget, position, ac
 }
 
 function cruzeRootTopLevelCompletions(document, classNode) {
-  const mainChk = cruzoTS.getTypeChecker(document);
-  const rootType = cruzoTS.getRootType(mainChk, classNode);
-  const props = cruzoTS.getPropertiesOfType(mainChk, rootType);
-  const tsApi = cruzoTS.ts;
-  return props.map((sym) => {
-    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
-    item.detail = "root · TypeScript";
-    return item;
-  });
+  const checker = cruzoTS.getTypeChecker(document);
+  const rootType = cruzoTS.getRootType(checker, classNode);
+  return symbolsToCompletionItems(cruzoTS.getPropertiesOfType(checker, rootType), "root · TypeScript");
 }
 
 function cruzeThisTopLevelCompletions(document, classNode, templateTarget, position) {
   const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
+  const checker = cruzoTS.getTypeChecker(document);
   const repeatParsed = cruzoTS.getRepeatParsedChain(raw, rel, parseOwnerAccessorExpression);
-  const thisType = cruzoTS.getThisTypeFromRepeat(document, classNode, repeatParsed);
-  const mainChk = cruzoTS.getTypeChecker(document);
-  const props = cruzoTS.getPropertiesOfType(mainChk, thisType);
-  const tsApi = cruzoTS.ts;
-  return props.map((sym) => {
-    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
-    item.detail = "this · TypeScript";
-    return item;
-  });
+  const thisType = cruzoTS.getThisTypeFromRepeatChain(checker, classNode, repeatParsed);
+  return symbolsToCompletionItems(cruzoTS.getPropertiesOfType(checker, thisType), "this · TypeScript");
 }
 
 function cruzeHoverForLetLexical(document, classNode, templateTarget, position, letName) {
   const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-  const binding = cruzoTS.findLetBindingForName(raw, rel, letName);
-  if (!binding || !binding.expr) {
-    return null;
-  }
-  const scopeRepeat = cruzoTS.getRepeatParsedChain(raw, binding.scopeOffset, parseOwnerAccessorExpression);
-  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
-  const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
+  const probe = cruzeLetExpressionProbe(document, classNode, raw, rel, letName);
   if (!probe) {
     return null;
   }
@@ -1208,24 +1224,15 @@ function cruzeHoverForLetLexical(document, classNode, templateTarget, position, 
 
 function cruzeLetTopLevelCompletions(document, classNode, templateTarget, position, letName) {
   const raw = templateTarget.raw;
-  const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-  const binding = cruzoTS.findLetBindingForName(raw, rel, letName);
-  if (!binding || !binding.expr) {
-    return [];
-  }
-  const scopeRepeat = cruzoTS.getRepeatParsedChain(raw, binding.scopeOffset, parseOwnerAccessorExpression);
-  const scopeThis = cruzoTS.getThisTypeFromRepeat(document, classNode, scopeRepeat);
-  const probe = cruzoTS.getExpressionType(document, classNode, scopeThis, binding.expr);
+  const rel = cruzeTemplateRelOffset(document, templateTarget, position);
+  const probe = cruzeLetExpressionProbe(document, classNode, raw, rel, letName);
   if (!probe) {
     return [];
   }
-  const props = cruzoTS.getPropertiesOfType(probe.checker, probe.type);
-  const tsApi = cruzoTS.ts;
-  return props.map((sym) => {
-    const item = new vscode.CompletionItem(sym.name, completionKindForTsSymbol(tsApi, sym));
-    item.detail = `${letName} · TypeScript`;
-    return item;
-  });
+  return symbolsToCompletionItems(
+    cruzoTS.getPropertiesOfType(probe.checker, probe.type),
+    `${letName} · TypeScript`
+  );
 }
 
 function buildCruzoAttributeCompletions() {
@@ -1501,11 +1508,7 @@ function activate(context) {
           return null;
         }
 
-        const sourceFile = cruzoTS.getSourceFile(document);
-        if (!sourceFile) {
-          return null;
-        }
-        const classNode = cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start));
+        const classNode = tryGetCruzoClassNode(document, templateTarget);
         if (!classNode) {
           return null;
         }
@@ -1649,16 +1652,17 @@ function activate(context) {
         if (!templateTarget) {
           return null;
         }
-        const sourceFile = cruzoTS.getSourceFile(document);
-        if (!sourceFile) {
-          return null;
-        }
-        const classNode = cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start));
+        const classNode = tryGetCruzoClassNode(document, templateTarget);
         if (!classNode) {
           return null;
         }
 
-        const ownerMember = getCompletionOwnerMemberForPosition(document, position, templateTarget);
+        const activeLets = cruzoTS.getActiveLetBindingMap(
+          templateTarget.raw,
+          cruzeTemplateRelOffset(document, templateTarget, position)
+        );
+
+        const ownerMember = getCompletionOwnerMemberForPosition(document, position, templateTarget, activeLets);
         if (ownerMember) {
           const items = cruzePropertyCompletionsFromChain(document, classNode, templateTarget, position, ownerMember);
           if (items.length) {
@@ -1666,19 +1670,15 @@ function activate(context) {
           }
         }
 
-        const owner = getExpressionOwnerForCompletion(document, position, templateTarget);
+        const owner = getExpressionOwnerForCompletion(document, position, templateTarget, activeLets);
         if (owner === "root") {
           return cruzeRootTopLevelCompletions(document, classNode);
         }
         if (owner === "this") {
           return cruzeThisTopLevelCompletions(document, classNode, templateTarget, position);
         }
-        if (owner) {
-          const rel = document.offsetAt(position) - document.offsetAt(templateTarget.range.start);
-          const activeLets = cruzoTS.getActiveLetBindingMap(templateTarget.raw, rel);
-          if (activeLets.has(owner)) {
-            return cruzeLetTopLevelCompletions(document, classNode, templateTarget, position, owner);
-          }
+        if (owner && activeLets.has(owner)) {
+          return cruzeLetTopLevelCompletions(document, classNode, templateTarget, position, owner);
         }
 
         const lineText = document.lineAt(position.line).text.slice(0, position.character);
@@ -1699,10 +1699,7 @@ function activate(context) {
         return null;
       }
 
-      const sourceFile = cruzoTS.getSourceFile(document);
-      const classNode = sourceFile
-        ? cruzoTS.getEnclosingClassNode(cruzoTS.ts, sourceFile, document.offsetAt(templateTarget.range.start))
-        : null;
+      const classNode = tryGetCruzoClassNode(document, templateTarget);
 
       const accessorMember =
         getTemplateAccessorMemberAtPosition(document, position, templateTarget)
